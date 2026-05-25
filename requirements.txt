@@ -5,7 +5,7 @@ python-dotenv==1.2.2
 #   PyTorch - instalado manualmente
 
 #   Diarização
-pyannote.audio==3.4.1
+pyannote.audio>=3.5.0
 lightning==2.5.0
 lightning-fabric==2.5.0
 pytorch-lightning==2.5.0
