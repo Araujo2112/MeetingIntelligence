@@ -1,0 +1,23 @@
+#   Core
+streamlit==1.57.0
+python-dotenv==1.2.2
+
+#   PyTorch - instalado manualmente
+
+#   Diarização
+pyannote.audio==3.4.1
+lightning==2.5.0
+lightning-fabric==2.5.0
+pytorch-lightning==2.5.0
+
+#   Transcrição
+faster-whisper==1.2.1
+
+#   Áudio
+librosa==0.11.0
+soundfile==0.13.1
+
+#   LLM local
+transformers==4.44.0
+accelerate==0.33.0
+bitsandbytes==0.43.3
