@@ -205,14 +205,24 @@ def run_diarization(waveform_tensor, hf_token, device):
         )
     pipeline.to(torch.device(device))
     audio_input = {"waveform": waveform_tensor, "sample_rate": 16000}
-    return pipeline(audio_input)
+    result = pipeline(audio_input)
+
+    # Liberta VRAM depois de usar
+    del pipeline
+    torch.cuda.empty_cache()
+    return result
 
 
 def run_transcription(audio_path, device):
     compute_type = "float16" if device == "cuda" else "float32"
     model = WhisperModel("large-v3-turbo", device=device, compute_type=compute_type)
     segments, info = model.transcribe(audio_path, word_timestamps=True)
-    return list(segments), info
+    segments = list(segments)  # força a execução completa antes de libertar
+    
+    # Liberta VRAM depois de usar
+    del model
+    torch.cuda.empty_cache()
+    return segments, info
 
 
 def get_speaker_at(diarization, timestamp):

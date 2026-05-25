@@ -11,6 +11,8 @@
 
 # How to Run
 
+---
+
 ## 1. Clone the repository
 ```bash
 git clone https://github.com/Araujo2112/2026-ei-aoopii-c25
