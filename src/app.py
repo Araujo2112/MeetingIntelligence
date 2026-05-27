@@ -5,10 +5,12 @@ import json
 import librosa
 import soundfile as sf
 import warnings
+import requests
+import uuid
+import re
+import whisper
 from dotenv import load_dotenv
 from pyannote.audio import Pipeline
-from faster_whisper import WhisperModel
-from transformers import AutoTokenizer, AutoModelForCausalLM
 
 warnings.filterwarnings("ignore")
 load_dotenv()
@@ -87,36 +89,157 @@ if "results" not in st.session_state:
     st.session_state.results = None
 
 
+def extract_stream_text(raw_text):
+    tokens = []
+    message_text = None
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("type")
+        if event_type == "token":
+            token = event.get("content", "")
+            if isinstance(token, str):
+                tokens.append(token)
+        elif event_type == "message":
+            content = event.get("content")
+            if isinstance(content, dict):
+                msg = content.get("content")
+                if isinstance(msg, str):
+                    message_text = msg
+            elif isinstance(content, str):
+                message_text = content
+        if "message" in event and isinstance(event["message"], str):
+            message_text = event["message"]
+    if message_text:
+        return message_text.strip()
+    return "".join(tokens).strip()
+
+
+def parse_first_json(text):
+    decoder = json.JSONDecoder()
+    text = text.strip()
+    try:
+        return decoder.raw_decode(text)[0]
+    except json.JSONDecodeError:
+        start = text.find("{")
+        if start != -1:
+            return decoder.raw_decode(text[start:])[0]
+        raise
+
+
+def is_transcription_failure(text):
+    if not text:
+        return True
+    lowered = text.lower()
+    failure_phrases = [
+        "no audio file",
+        "no audio",
+        "can't access",
+        "can’t access",
+        "cannot access",
+        "can't open",
+        "can’t open",
+        "could not open",
+        "unable to access",
+        "i can't access",
+        "i can’t access",
+        "i cannot access",
+        "no file was provided",
+        "audio file here",
+    ]
+    if any(phrase in lowered for phrase in failure_phrases):
+        return True
+    if re.fullmatch(r"[0-9a-fA-F-]{36}", text.strip()):
+        return True
+    return False
+
+
+def transcribe_local(audio_path, device):
+    model = whisper.load_model("small", device=device)
+    try:
+        result = model.transcribe(audio_path, fp16=(device == "cuda"), word_timestamps=True)
+    except TypeError:
+        result = model.transcribe(audio_path, fp16=(device == "cuda"))
+    segments = []
+    for seg in result.get("segments", []):
+        words = []
+        for word in seg.get("words", []) or []:
+            words.append(type("Word", (), {
+                "start": word["start"],
+                "end": word["end"],
+                "word": word["word"]
+            })())
+        segment = type("Segment", (), {
+            "start": seg["start"],
+            "end": seg["end"],
+            "text": seg["text"],
+            "words": words
+        })()
+        segments.append(segment)
+    info = type("TranscriptionInfo", (), {
+        "duration": result.get("duration", 0) or librosa.get_duration(filename=audio_path),
+        "language": result.get("language", "auto")
+    })()
+    return segments, info
+
+
+def transcribe_by_diarization(audio_path, diarization, device):
+    model = whisper.load_model("small", device=device)
+    waveform, sr = librosa.load(audio_path, sr=16000, mono=True)
+    segments = []
+    for turn, _, _ in diarization.itertracks(yield_label=True):
+        start = max(0, int(turn.start * sr))
+        end = max(start + 1, int(turn.end * sr))
+        chunk = waveform[start:end]
+        if len(chunk) < int(0.2 * sr):
+            continue
+        try:
+            result = model.transcribe(chunk, fp16=(device == "cuda"))
+        except TypeError:
+            result = model.transcribe(chunk)
+        text = (result.get("text") or "").strip()
+        if not text:
+            continue
+        segment = type("Segment", (), {
+            "start": turn.start,
+            "end": turn.end,
+            "text": text,
+            "words": []
+        })()
+        segments.append(segment)
+    info = type("TranscriptionInfo", (), {
+        "duration": librosa.get_duration(filename=audio_path),
+        "language": "auto"
+    })()
+    return segments, info
+
+
 # ─────────────────────────────────────────────
-# QWEN — carregado uma vez e cacheado
+# CLAUDE ANALYSIS — via IAedu API
 # ─────────────────────────────────────────────
 
-QWEN_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
-
-@st.cache_resource(show_spinner="🤖 A carregar modelo de análise...")
-def load_qwen():
-    tokenizer = AutoTokenizer.from_pretrained(QWEN_MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(
-        QWEN_MODEL_ID,
-        torch_dtype=torch.float16,
-        device_map="cuda",
-    )
-    model.eval()
-    return tokenizer, model
-
-
-def run_qwen_analysis(blocks):
-    tokenizer, model = load_qwen()
-
+def run_claude_analysis(blocks):
+    """Analyze meeting using Claude via IAedu API"""
+    
+    url = os.getenv("IAEDU_CLAUDE_URL")
+    api_key = os.getenv("IAEDU_CLAUDE_KEY")
+    channel_id = os.getenv("IAEDU_CLAUDE_CHANNEL")
+    
+    if not all([url, api_key, channel_id]):
+        raise ValueError("Missing IAedu Claude API credentials")
+    
+    thread_id = str(uuid.uuid4())
+    
     transcript_text = "\n".join([f"{b['speaker']}: {b['text']}" for b in blocks])
-
-    system_prompt = (
-        "You are an expert meeting analyst. "
-        "You always respond with a single valid JSON object and nothing else — "
-        "no markdown, no backticks, no extra explanation."
-    )
-
-    user_prompt = f"""Analyze the following meeting transcript and extract structured information.
+    
+    message = f"""Analyze the following meeting transcript and extract structured information.
 
 TRANSCRIPT:
 {transcript_text}
@@ -142,38 +265,45 @@ Return ONLY a valid JSON object with exactly this structure:
 Rules:
 - decisions: include both explicit ("we decided...") and implicit decisions
 - action_items: only include if someone is clearly assigned a task
-- open_questions: questions raised but left unanswered
+- open_questions: MUST include any question that appears in the transcript and is NOT answered later
+- open_questions: keep the exact question text (or a faithful paraphrase if needed)
+- open_questions: if there are zero unanswered questions, return []
 - If a field has no items, return an empty array []
 - Respond in the same language as the transcript
 """
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": user_prompt},
-    ]
-
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    inputs = tokenizer([text], return_tensors="pt").to(model.device)
-
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=1024,
-            do_sample=False,
-            temperature=None,
-            top_p=None,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-
-    generated = output_ids[0][inputs["input_ids"].shape[-1]:]
-    raw = tokenizer.decode(generated, skip_special_tokens=True).strip()
-    raw = raw.replace("```json", "").replace("```", "").strip()
-
-    return json.loads(raw)
+    
+    files = {
+        'channel_id': (None, channel_id),
+        'thread_id': (None, thread_id),
+        'user_info': (None, '{}'),
+        'message': (None, message),
+    }
+    
+    headers = {
+        'x-api-key': api_key
+    }
+    
+    try:
+        response = requests.post(url, files=files, headers=headers, timeout=60)
+        response.raise_for_status()
+        
+        raw_text = response.text.strip()
+        
+        if not raw_text:
+            raise ValueError("Empty response from Claude API")
+        
+        analysis_text = extract_stream_text(raw_text)
+        analysis_text = analysis_text.replace("```json", "").replace("```", "").strip()
+        
+        if not analysis_text:
+            raise ValueError("Could not extract analysis from response")
+        
+        return parse_first_json(analysis_text)
+        
+    except json.JSONDecodeError as e:
+        raise Exception(f"Invalid JSON from Claude: {str(e)}")
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Claude API error: {str(e)}")
 
 
 # ─────────────────────────────────────────────
@@ -213,16 +343,86 @@ def run_diarization(waveform_tensor, hf_token, device):
     return result
 
 
-def run_transcription(audio_path, device):
-    compute_type = "float16" if device == "cuda" else "float32"
-    model = WhisperModel("large-v3-turbo", device=device, compute_type=compute_type)
-    segments, info = model.transcribe(audio_path, word_timestamps=True)
-    segments = list(segments)  # força a execução completa antes de libertar
+def run_transcription(audio_path, device=None, diarization=None):
+    """Transcribe audio using OpenAI API via IAedu"""
     
-    # Liberta VRAM depois de usar
-    del model
-    torch.cuda.empty_cache()
-    return segments, info
+    url = os.getenv("IAEDU_OPENAI_URL")
+    api_key = os.getenv("IAEDU_OPENAI_KEY")
+    channel_id = os.getenv("IAEDU_OPENAI_CHANNEL")
+    
+    if not all([url, api_key, channel_id]):
+        raise ValueError("Missing IAedu OpenAI API credentials")
+    
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Ler ficheiro de áudio
+    with open(audio_path, "rb") as audio_file:
+        audio_data = audio_file.read()
+    
+    headers = {
+        "x-api-key": api_key
+    }
+    
+    data = {
+        "channel_id": channel_id,
+        "user_info": "{}",
+        "message": "Transcribe this audio file to text. Return ONLY the transcription text.",
+    }
+    
+    field_names = ["image", "file", "audio", "audio_file", "media", "attachment", "document"]
+    
+    transcription_text = None
+    for field_name in field_names:
+        thread_id = str(uuid.uuid4())
+        data["thread_id"] = thread_id
+        files = {
+            field_name: ("audio.wav", audio_data, "audio/wav"),
+        }
+        
+        try:
+            response = requests.post(url, data=data, files=files, headers=headers, timeout=60)
+            response.raise_for_status()
+        except requests.exceptions.RequestException:
+            continue
+        
+        raw_text = response.text.strip()
+        if not raw_text:
+            continue
+        
+        extracted = extract_stream_text(raw_text)
+        if not extracted:
+            continue
+        
+        extracted = extracted.replace("```json", "").replace("```", "").strip()
+        if not extracted:
+            continue
+
+        if is_transcription_failure(extracted):
+            continue
+        
+        transcription_text = extracted
+        break
+    
+    if not transcription_text:
+        st.warning("⚠️ IAedu OpenAI não aceitou o áudio. A usar Whisper local.")
+        if diarization is not None:
+            return transcribe_by_diarization(audio_path, diarization, device)
+        return transcribe_local(audio_path, device)
+    
+    segment = type("Segment", (), {
+        "start": 0,
+        "end": 0,
+        "text": transcription_text,
+        "words": []
+    })()
+    
+    info = type("TranscriptionInfo", (), {
+        "duration": librosa.get_duration(filename=audio_path),
+        "language": "auto"
+    })()
+    
+    return [segment], info
 
 
 def get_speaker_at(diarization, timestamp):
@@ -426,14 +626,14 @@ if uploaded_file:
                     st.toast(f"{len(speakers)} locutor(es) identificado(s)!", icon="👥")
 
                     status.write("📝 A transcrever áudio...")
-                    segments, info = run_transcription(audio_path, device)
+                    segments, info = run_transcription(audio_path, device, diarization)
                     st.toast("Transcrição concluída!", icon="✅")
 
                     status.write("🔗 A cruzar transcrição com locutores...")
                     blocks = merge_transcript_with_speakers(segments, diarization)
 
-                    status.write("🤖 A analisar reunião com Qwen2.5-3B...")
-                    analysis = run_qwen_analysis(blocks)
+                    status.write("🤖 A analisar reunião com Claude...")
+                    analysis = run_claude_analysis(blocks)
                     st.toast("Análise inteligente concluída!", icon="🧠")
 
                     # Guarda tudo no session_state
