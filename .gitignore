@@ -28,3 +28,4 @@ huggingface/
 Thumbs.db
 ready.wav
 temp_raw_audio
+extension/config.js

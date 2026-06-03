@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Meeting Intelligence",
+  "version": "1.0",
+  "description": "Transcrição e análise automática de reuniões Google Meet",
+
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "storage"
+  ],
+
+  "host_permissions": [
+    "https://meet.google.com/*",
+    "https://api.iaedu.pt/*"
+  ],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "action": {
+    "default_title": "Meeting Intelligence",
+    "default_popup": "popup.html"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["https://meet.google.com/*"],
+      "js": ["config.js", "api.js", "content.js"],
+      "css": ["sidebar.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
