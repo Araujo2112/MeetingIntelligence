@@ -38,30 +38,27 @@ function parseFirstJson(text) {
 
 async function transcribeAudioInBackground(audioData, mimeType) {
   var blob = new Blob([new Uint8Array(audioData)], { type: mimeType });
-  var fieldNames = ["audio", "audio_file", "file", "media", "attachment"];
-  var threadId = generateThreadId();
 
-  for (var i = 0; i < fieldNames.length; i++) {
-    var field = fieldNames[i];
+  try {
     var formData = new FormData();
-    formData.append("channel_id", CONFIG.IAEDU_OPENAI_CHANNEL);
-    formData.append("thread_id", threadId);
-    formData.append("user_info", "{}");
-    formData.append("message", "Transcribe this audio file to text. Return ONLY the transcription text.");
-    formData.append(field, blob, "audio.webm");
+    formData.append("audio", blob, "audio.webm");
 
-    try {
-      var res = await fetch(CONFIG.IAEDU_OPENAI_URL, {
-        method: "POST",
-        headers: { "x-api-key": CONFIG.IAEDU_OPENAI_KEY },
-        body: formData,
-      });
-      if (!res.ok) continue;
-      var text = extractStreamText(await res.text());
-      if (text && text.length > 5) return { success: true, text };
-    } catch(_) { continue; }
+    const res = await fetch("http://localhost:5000/api/transcribe", {
+      method: "POST",
+      body: formData,
+    });
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    
+    const data = await res.json();
+    if (data.success && data.text && data.text.length > 5) {
+      return { success: true, text: data.text };
+    }
+    throw new Error(data.error || "Transcrição falhou");
+  } catch (err) {
+    console.error("[MI] Erro na transcrição:", err.message);
+    throw new Error("Transcrição falhou: " + err.message);
   }
-  throw new Error("Transcrição falhou em todos os campos");
 }
 
 async function analyzeInBackground(blocks) {

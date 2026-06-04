@@ -2,6 +2,10 @@
 streamlit==1.57.0
 python-dotenv==1.2.2
 
+#   API Server (para extensão Chrome)
+flask==3.0.0
+flask-cors==4.0.0
+
 #   PyTorch - instalado manualmente
 
 #   Diarização

@@ -118,6 +118,12 @@
     btnExport.classList.remove("mi-hidden");
   }
 
+  // ── Helper: adicionar bloco de transcrição ──
+  function addTranscribedBlock(speaker, text) {
+    if (!text || text.trim().length < 2) return;
+    addBlock(speaker, text.trim());
+  }
+
   // ── Processar chunk de áudio ──────────────
   function processChunk(blob) {
     if (blob.size < 1000) return;
@@ -181,11 +187,10 @@
       mediaRecorder.ondataavailable = function(e) {
         if (e.data && e.data.size > 0) audioChunks.push(e.data);
       };
-      mediaRecorder.start(); // sem timeslice — chunk único no stop
-      console.log("[MI] gravação iniciada");
+      mediaRecorder.start();
+      console.log("[MI] gravação iniciada - capturando todo áudio da reunião");
       sendResponse({ success: true });
     }).catch(function(err) {
-      // AbortError = utilizador cancelou o seletor, não é um erro real
       if (err.name === "AbortError" || err.name === "NotAllowedError") {
         sendResponse({ success: false, error: "Cancelado." });
       } else {
