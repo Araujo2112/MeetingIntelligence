@@ -3,10 +3,8 @@
 
   // ── Estado ────────────────────────────────
   var isRecording      = false;
-  var mediaRecorder    = null;
   var captureStream    = null;
   var recordingStart   = null;
-  var audioChunks      = [];
   var transcriptBlocks = [];
   var speakerColors    = {};
   var COLORS = ["#6366f1", "#06b6d4", "#10b981", "#f59e0b", "#f43f5e", "#a855f7"];
@@ -95,12 +93,25 @@
 
   function showSidebar() { sidebar.classList.remove("mi-hidden-sidebar"); }
   function hideSidebar() { sidebar.classList.add("mi-hidden-sidebar"); }
-
   btnClose.addEventListener("click", hideSidebar);
 
-  // ── Adicionar bloco de transcrição ────────
+  // ── Adicionar bloco — merge se mesmo locutor ──
   function addBlock(speaker, text) {
+    if (!text || text.trim().length < 2) return;
+    text = text.trim();
     var color = getSpeakerColor(speaker);
+
+    if (transcriptBlocks.length > 0) {
+      var last = transcriptBlocks[transcriptBlocks.length - 1];
+      if (last.speaker === speaker) {
+        last.text += " " + text;
+        var lastRow = transcriptEl.lastElementChild;
+        if (lastRow) lastRow.querySelector(".mi-sp-text").textContent = last.text;
+        transcriptEl.scrollTop = transcriptEl.scrollHeight;
+        return;
+      }
+    }
+
     transcriptBlocks.push({ speaker: speaker, text: text });
     emptyEl.classList.add("mi-hidden");
     liveEl.classList.remove("mi-hidden");
@@ -118,78 +129,98 @@
     btnExport.classList.remove("mi-hidden");
   }
 
-  // ── Helper: adicionar bloco de transcrição ──
-  function addTranscribedBlock(speaker, text) {
-    if (!text || text.trim().length < 2) return;
-    addBlock(speaker, text.trim());
-  }
-
-  // ── Processar chunk de áudio ──────────────
-  function processChunk(blob) {
-    if (blob.size < 1000) return;
-    loadingEl.classList.remove("mi-hidden");
-    loadingText.textContent = "A transcrever...";
-
+  // ── Transcreve um blob e chama addBlock ───
+  function transcribeAndAdd(blob, speakerLabel) {
+    if (!blob || blob.size < 2000) return;
     var reader = new FileReader();
     reader.onloadend = function() {
       var audioData = Array.from(new Uint8Array(reader.result));
       chrome.runtime.sendMessage({ action: "TRANSCRIBE", audioData: audioData, mimeType: "audio/webm" }, function(res) {
-        if (res && res.success && res.text && res.text.trim().length > 2) {
-          addBlock("SPEAKER", res.text.trim());
-        } else if (res && !res.success) {
-          console.warn("[MI] transcrição falhou:", res.error);
-        }
-        loadingEl.classList.add("mi-hidden");
+        if (res && res.success && res.text) addBlock(speakerLabel, res.text);
+        else if (res && !res.success) console.warn("[MI]", speakerLabel, res.error);
       });
     };
     reader.readAsArrayBuffer(blob);
   }
 
-  function runAnalysis() {
-    if (!transcriptBlocks.length) return;
-    loadingEl.classList.remove("mi-hidden");
-    loadingText.textContent = "A analisar com Claude...";
-    btnAnalyze.disabled = true;
+  // ── Cria um recorder em tempo real para um stream ──
+  function makeLiveRecorder(stream, speakerLabel) {
+    var header   = null;
+    var isFirst  = true;
+    var rec      = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
 
-    chrome.runtime.sendMessage({ action: "ANALYZE", blocks: transcriptBlocks }, function(res) {
-      loadingEl.classList.add("mi-hidden");
-      btnAnalyze.disabled = false;
-      if (res && res.success) {
-        renderAnalysis(res.data);
-      } else {
-        alert("Erro na análise: " + (res?.error || "desconhecido"));
+    rec.ondataavailable = function(e) {
+      if (!e.data || e.data.size === 0) return;
+      if (isFirst) {
+        header  = e.data;   // 1º chunk = header WebM puro
+        isFirst = false;
+        return;
       }
-    });
+      // header + chunk = ficheiro WebM válido e autónomo
+      transcribeAndAdd(new Blob([header, e.data], { type: "audio/webm" }), speakerLabel);
+    };
+
+    // Captura header num timeslice curto, depois chunks de 8s
+    rec.start(500);
+    setTimeout(function() {
+      if (rec.state !== "recording") return;
+      rec.stop();
+      var rec2 = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
+      rec2.ondataavailable = function(e) {
+        if (!e.data || e.data.size === 0) return;
+        transcribeAndAdd(new Blob([header, e.data], { type: "audio/webm" }), speakerLabel);
+      };
+      rec2.start(8000);
+      stream._rec = rec2;
+    }, 600);
+
+    stream._rec = rec;
   }
 
-  // ── Iniciar gravação com getDisplayMedia ──
+  // ── Iniciar gravação dual-stream ──────────
   function startRecording(sendResponse) {
     navigator.mediaDevices.getDisplayMedia({
       video: true,
       audio: { echoCancellation: false, noiseSuppression: false },
       preferCurrentTab: true,
-    }).then(function(stream) {
-      // Para a track de vídeo — só queremos áudio
-      stream.getVideoTracks().forEach(function(t) { t.stop(); });
+    }).then(function(tabStream) {
+      tabStream.getVideoTracks().forEach(function(t) { t.stop(); });
 
-      var audioTracks = stream.getAudioTracks();
-      if (!audioTracks.length) {
-        sendResponse({ success: false, error: "Sem áudio. Activa 'Partilhar áudio do separador' no seletor." });
+      var tabTracks = tabStream.getAudioTracks();
+      if (!tabTracks.length) {
+        sendResponse({ success: false, error: "Sem áudio. Activa 'Partilhar áudio do separador'." });
         return;
       }
 
-      audioChunks    = [];
-      captureStream  = new MediaStream(audioTracks);
+      // Tenta detectar o nome do utilizador no Meet
+      var selfName = "Eu";
+      var selfEl   = document.querySelector('[data-self-name]');
+      if (selfEl && selfEl.textContent.trim()) selfName = selfEl.textContent.trim();
+
       recordingStart = Date.now();
       isRecording    = true;
 
-      mediaRecorder = new MediaRecorder(captureStream, { mimeType: "audio/webm;codecs=opus" });
-      mediaRecorder.ondataavailable = function(e) {
-        if (e.data && e.data.size > 0) audioChunks.push(e.data);
-      };
-      mediaRecorder.start();
-      console.log("[MI] gravação iniciada - capturando todo áudio da reunião");
-      sendResponse({ success: true });
+      var tabMediaStream = new MediaStream(tabTracks);
+      captureStream = { _tabStream: tabStream };
+
+      makeLiveRecorder(tabMediaStream, "Participantes");
+      captureStream._tabMediaStream = tabMediaStream;
+
+      // Microfone com echo cancellation para não capturar os altifalantes
+      navigator.mediaDevices.getUserMedia({ audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        suppressLocalAudioPlayback: true,
+      }, video: false }).then(function(micStream) {
+        captureStream._micStream = micStream;
+        makeLiveRecorder(micStream, selfName);
+        sendResponse({ success: true });
+      }).catch(function() {
+        console.warn("[MI] Microfone não disponível.");
+        sendResponse({ success: true });
+      });
+
     }).catch(function(err) {
       if (err.name === "AbortError" || err.name === "NotAllowedError") {
         sendResponse({ success: false, error: "Cancelado." });
@@ -199,49 +230,40 @@
     });
   }
 
+  // ── Parar gravação ────────────────────────
   function stopRecording(sendResponse) {
     isRecording = false;
+    if (!captureStream) { sendResponse({ success: true }); return; }
 
-    if (mediaRecorder && mediaRecorder.state !== "inactive") {
-      mediaRecorder.onstop = function() {
-        if (captureStream) {
-          captureStream.getTracks().forEach(function(t) { t.stop(); });
-          captureStream = null;
-        }
-        if (audioChunks.length === 0) {
-          sendResponse({ success: true });
-          return;
-        }
-        // Ficheiro WebM completo — junta todos os chunks
-        var fullBlob = new Blob(audioChunks, { type: "audio/webm" });
-        audioChunks  = [];
-
-        loadingEl.classList.remove("mi-hidden");
-        loadingText.textContent = "A transcrever reunião...";
-
-        var reader = new FileReader();
-        reader.onloadend = function() {
-          var audioData = Array.from(new Uint8Array(reader.result));
-          chrome.runtime.sendMessage({ action: "TRANSCRIBE", audioData: audioData, mimeType: "audio/webm" }, function(res) {
-            loadingEl.classList.add("mi-hidden");
-            if (res && res.success && res.text && res.text.trim().length > 2) {
-              addBlock("SPEAKER", res.text.trim());
-            } else {
-              console.warn("[MI] transcrição falhou:", res?.error);
-            }
-            sendResponse({ success: true });
-          });
-        };
-        reader.readAsArrayBuffer(fullBlob);
-      };
-      mediaRecorder.stop();
-    } else {
-      if (captureStream) {
-        captureStream.getTracks().forEach(function(t) { t.stop(); });
-        captureStream = null;
+    if (captureStream._tabMediaStream) {
+      if (captureStream._tabMediaStream._rec && captureStream._tabMediaStream._rec.state !== "inactive") {
+        captureStream._tabMediaStream._rec.stop();
       }
-      sendResponse({ success: true });
+      captureStream._tabStream.getTracks().forEach(function(t) { t.stop(); });
     }
+    if (captureStream._micStream) {
+      if (captureStream._micStream._rec && captureStream._micStream._rec.state !== "inactive") {
+        captureStream._micStream._rec.stop();
+      }
+      captureStream._micStream.getTracks().forEach(function(t) { t.stop(); });
+    }
+    captureStream = null;
+    sendResponse({ success: true });
+  }
+
+  // ── Análise automática ────────────────────
+  function runAnalysis() {
+    if (!transcriptBlocks.length) return;
+    showSidebar();
+    loadingEl.classList.remove("mi-hidden");
+    loadingText.textContent = "A analisar com Claude...";
+    btnAnalyze.disabled = true;
+    chrome.runtime.sendMessage({ action: "ANALYZE", blocks: transcriptBlocks }, function(res) {
+      loadingEl.classList.add("mi-hidden");
+      btnAnalyze.disabled = false;
+      if (res && res.success) renderAnalysis(res.data);
+      else alert("Erro na análise: " + (res && res.error || "desconhecido"));
+    });
   }
 
   // ── Render análise ────────────────────────
@@ -293,9 +315,7 @@
     URL.revokeObjectURL(url);
   }
 
-  // ── Botões da sidebar ─────────────────────
   btnAnalyze.addEventListener("click", runAnalysis);
-
   btnExport.addEventListener("click", exportTranscript);
 
   // ── Mensagens do popup ────────────────────
@@ -304,20 +324,17 @@
       sendResponse({
         recording: isRecording,
         elapsed: recordingStart ? Math.floor((Date.now() - recordingStart) / 1000) : 0,
-        blocks: transcriptBlocks.length,
       });
     }
-
     if (msg.action === "START_RECORDING") {
       startRecording(sendResponse);
-      return true; // async
+      return true;
     }
-
     if (msg.action === "STOP_RECORDING") {
       stopRecording(sendResponse);
-      return true; // async
+      runAnalysis();
+      return true;
     }
-
     if (msg.action === "SHOW_SIDEBAR") {
       showSidebar();
       sendResponse({ success: true });
