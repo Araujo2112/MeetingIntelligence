@@ -9,6 +9,11 @@
   var speakerColors    = {};
   var COLORS = ["#6366f1", "#06b6d4", "#10b981", "#f59e0b", "#f43f5e", "#a855f7"];
 
+  // Acumuladores de áudio — mix tab + mic num único recorder
+  var mixChunks   = [];
+  var mixRecorder = null;
+  var audioCtx    = null;
+
   function getSpeakerColor(name) {
     if (!speakerColors[name]) {
       speakerColors[name] = COLORS[Object.keys(speakerColors).length % COLORS.length];
@@ -129,56 +134,28 @@
     btnExport.classList.remove("mi-hidden");
   }
 
-  // ── Transcreve um blob e chama addBlock ───
-  function transcribeAndAdd(blob, speakerLabel) {
-    if (!blob || blob.size < 2000) return;
-    var reader = new FileReader();
-    reader.onloadend = function() {
-      var audioData = Array.from(new Uint8Array(reader.result));
-      chrome.runtime.sendMessage({ action: "TRANSCRIBE", audioData: audioData, mimeType: "audio/webm" }, function(res) {
-        if (res && res.success && res.text) addBlock(speakerLabel, res.text);
-        else if (res && !res.success) console.warn("[MI]", speakerLabel, res.error);
-      });
-    };
-    reader.readAsArrayBuffer(blob);
-  }
-
-  // ── Cria um recorder em tempo real para um stream ──
-  function makeLiveRecorder(stream, speakerLabel) {
-    var header   = null;
-    var isFirst  = true;
-    var rec      = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
-
-    rec.ondataavailable = function(e) {
-      if (!e.data || e.data.size === 0) return;
-      if (isFirst) {
-        header  = e.data;   // 1º chunk = header WebM puro
-        isFirst = false;
-        return;
-      }
-      // header + chunk = ficheiro WebM válido e autónomo
-      transcribeAndAdd(new Blob([header, e.data], { type: "audio/webm" }), speakerLabel);
-    };
-
-    // Captura header num timeslice curto, depois chunks de 8s
-    rec.start(500);
-    setTimeout(function() {
-      if (rec.state !== "recording") return;
-      rec.stop();
-      var rec2 = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
-      rec2.ondataavailable = function(e) {
-        if (!e.data || e.data.size === 0) return;
-        transcribeAndAdd(new Blob([header, e.data], { type: "audio/webm" }), speakerLabel);
+  // ── Envia blob completo para transcrever ──
+  function transcribeFullBlob(blob) {
+    return new Promise(function(resolve, reject) {
+      var reader = new FileReader();
+      reader.onloadend = function() {
+        var audioData = Array.from(new Uint8Array(reader.result));
+        chrome.runtime.sendMessage(
+          { action: "TRANSCRIBE", audioData: audioData, mimeType: "audio/webm" },
+          function(res) {
+            if (res && res.success) resolve(res);
+            else reject(new Error(res ? res.error : "Sem resposta"));
+          }
+        );
       };
-      rec2.start(8000);
-      stream._rec = rec2;
-    }, 600);
-
-    stream._rec = rec;
+      reader.readAsArrayBuffer(blob);
+    });
   }
 
-  // ── Iniciar gravação dual-stream ──────────
+  // ── Iniciar gravação — mix tab + mic num único recorder ──
   function startRecording(sendResponse) {
+    mixChunks = [];
+
     navigator.mediaDevices.getDisplayMedia({
       video: true,
       audio: { echoCancellation: false, noiseSuppression: false },
@@ -192,32 +169,45 @@
         return;
       }
 
-      // Tenta detectar o nome do utilizador no Meet
-      var selfName = "Eu";
-      var selfEl   = document.querySelector('[data-self-name]');
-      if (selfEl && selfEl.textContent.trim()) selfName = selfEl.textContent.trim();
-
       recordingStart = Date.now();
       isRecording    = true;
 
       var tabMediaStream = new MediaStream(tabTracks);
-      captureStream = { _tabStream: tabStream };
+      captureStream = { _tabStream: tabStream, _tabMediaStream: tabMediaStream };
 
-      makeLiveRecorder(tabMediaStream, "Participantes");
-      captureStream._tabMediaStream = tabMediaStream;
-
-      // Microfone com echo cancellation para não capturar os altifalantes
-      navigator.mediaDevices.getUserMedia({ audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-        suppressLocalAudioPlayback: true,
-      }, video: false }).then(function(micStream) {
+      navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          suppressLocalAudioPlayback: true,
+        },
+        video: false,
+      }).then(function(micStream) {
         captureStream._micStream = micStream;
-        makeLiveRecorder(micStream, selfName);
+
+        // Mistura tab + mic num único AudioContext
+        audioCtx = new AudioContext();
+        var dest = audioCtx.createMediaStreamDestination();
+        audioCtx.createMediaStreamSource(tabMediaStream).connect(dest);
+        audioCtx.createMediaStreamSource(micStream).connect(dest);
+
+        mixRecorder = new MediaRecorder(dest.stream, { mimeType: "audio/webm;codecs=opus" });
+        mixRecorder.ondataavailable = function(e) {
+          if (e.data && e.data.size > 0) mixChunks.push(e.data);
+        };
+        mixRecorder.start(1000);
+
         sendResponse({ success: true });
+
       }).catch(function() {
-        console.warn("[MI] Microfone não disponível.");
+        // Sem microfone — grava só o tab
+        console.warn("[MI] Microfone não disponível, a gravar só tab.");
+        mixRecorder = new MediaRecorder(tabMediaStream, { mimeType: "audio/webm;codecs=opus" });
+        mixRecorder.ondataavailable = function(e) {
+          if (e.data && e.data.size > 0) mixChunks.push(e.data);
+        };
+        mixRecorder.start(1000);
         sendResponse({ success: true });
       });
 
@@ -230,28 +220,57 @@
     });
   }
 
-  // ── Parar gravação ────────────────────────
+  // ── Parar gravação e transcrever tudo no fim ──
   function stopRecording(sendResponse) {
     isRecording = false;
-    if (!captureStream) { sendResponse({ success: true }); return; }
 
-    if (captureStream._tabMediaStream) {
-      if (captureStream._tabMediaStream._rec && captureStream._tabMediaStream._rec.state !== "inactive") {
-        captureStream._tabMediaStream._rec.stop();
+    function onStopped() {
+      if (captureStream) {
+        if (captureStream._tabStream) captureStream._tabStream.getTracks().forEach(function(t) { t.stop(); });
+        if (captureStream._micStream) captureStream._micStream.getTracks().forEach(function(t) { t.stop(); });
+        captureStream = null;
       }
-      captureStream._tabStream.getTracks().forEach(function(t) { t.stop(); });
-    }
-    if (captureStream._micStream) {
-      if (captureStream._micStream._rec && captureStream._micStream._rec.state !== "inactive") {
-        captureStream._micStream._rec.stop();
+      if (audioCtx) { audioCtx.close(); audioCtx = null; }
+
+      sendResponse({ success: true });
+
+      showSidebar();
+      loadingEl.classList.remove("mi-hidden");
+      loadingText.textContent = "A transcrever...";
+
+      var fullBlob = new Blob(mixChunks, { type: "audio/webm" });
+
+      if (!fullBlob || fullBlob.size < 2000) {
+        loadingEl.classList.add("mi-hidden");
+        emptyEl.classList.remove("mi-hidden");
+        emptyEl.querySelector("p").textContent = "Sem áudio suficiente para transcrever.";
+        return;
       }
-      captureStream._micStream.getTracks().forEach(function(t) { t.stop(); });
+
+      transcribeFullBlob(fullBlob).then(function(res) {
+        loadingEl.classList.add("mi-hidden");
+        if (res.diarized && res.blocks) {
+          res.blocks.forEach(function(b) { addBlock(b.speaker, b.text); });
+        } else if (res.text) {
+          addBlock("Participante", res.text);
+        }
+      }).catch(function(err) {
+        loadingEl.classList.add("mi-hidden");
+        console.error("[MI] Erro na transcrição:", err.message);
+        emptyEl.classList.remove("mi-hidden");
+        emptyEl.querySelector("p").textContent = "Erro na transcrição: " + err.message;
+      });
     }
-    captureStream = null;
-    sendResponse({ success: true });
+
+    if (mixRecorder && mixRecorder.state !== "inactive") {
+      mixRecorder.onstop = onStopped;
+      mixRecorder.stop();
+    } else {
+      onStopped();
+    }
   }
 
-  // ── Análise automática ────────────────────
+  // ── Análise com Claude ────────────────────
   function runAnalysis() {
     if (!transcriptBlocks.length) return;
     showSidebar();
@@ -332,7 +351,6 @@
     }
     if (msg.action === "STOP_RECORDING") {
       stopRecording(sendResponse);
-      runAnalysis();
       return true;
     }
     if (msg.action === "SHOW_SIDEBAR") {

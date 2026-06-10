@@ -39,26 +39,31 @@ function parseFirstJson(text) {
 async function transcribeAudioInBackground(audioData, mimeType) {
   var blob = new Blob([new Uint8Array(audioData)], { type: mimeType });
 
-  try {
-    var formData = new FormData();
-    formData.append("audio", blob, "audio.webm");
+  var formData = new FormData();
+  formData.append("audio", blob, "audio.webm");
 
-    const res = await fetch("http://localhost:5000/api/transcribe", {
-      method: "POST",
-      body: formData,
-    });
+  const res = await fetch("http://localhost:5000/api/transcribe", {
+    method: "POST",
+    body: formData,
+  });
 
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    
-    const data = await res.json();
-    if (data.success && data.text && data.text.length > 5) {
-      return { success: true, text: data.text };
-    }
-    throw new Error(data.error || "Transcrição falhou");
-  } catch (err) {
-    console.error("[MI] Erro na transcrição:", err.message);
-    throw new Error("Transcrição falhou: " + err.message);
+  const data = await res.json();
+
+  if (!res.ok || !data.success) {
+    throw new Error(data.error || `HTTP ${res.status}`);
   }
+
+  // Se diarizado, devolve os blocos com speaker individual
+  if (data.diarized && Array.isArray(data.blocks) && data.blocks.length > 0) {
+    return { success: true, diarized: true, blocks: data.blocks };
+  }
+
+  // Fallback sem diarização
+  if (data.text && data.text.trim().length > 1) {
+    return { success: true, diarized: false, text: data.text.trim() };
+  }
+
+  throw new Error("Sem texto na resposta");
 }
 
 async function analyzeInBackground(blocks) {
@@ -96,7 +101,7 @@ Rules: empty fields return [], respond in transcript language, return ONLY JSON.
 chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
   if (msg.action === "TRANSCRIBE") {
     transcribeAudioInBackground(msg.audioData, msg.mimeType)
-      .then(function(result) { sendResponse({ success: true, text: result.text }); })
+      .then(function(result) { sendResponse(result); })
       .catch(function(err) { sendResponse({ success: false, error: err.message }); });
     return true;
   }
