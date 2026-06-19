@@ -13,7 +13,9 @@
 
 ## O que faz
 
-Processa gravações de reuniões e devolve:
+Sistema de inteligência para reuniões com duas componentes:
+
+**App Streamlit** — carrega ficheiros de áudio, transcreve com Whisper, diariza com pyannote e analisa com Claude. Devolve:
 
 - **Transcrição** com identificação de locutores (diarização)
 - **Resumo** automático da reunião
@@ -22,33 +24,48 @@ Processa gravações de reuniões e devolve:
 - **Questões em aberto** não resolvidas
 - **Exportação** em TXT, Markdown e JSON
 
+**Extensão Chrome** — captura áudio em tempo real de reuniões Google Meet, transcreve com Whisper local e analisa com Claude via IAedu.
+
+---
+
+## Tech Stack
+
+| Componente | Tecnologia |
+|------------|------------|
+| Transcrição | Whisper (faster-whisper) |
+| Diarização | pyannote.audio 3.1 |
+| Análise | Claude (via IAedu) |
+| Interface web | Streamlit |
+| Extensão | Chrome Manifest V3 |
+| Servidor local | Flask |
+
 ---
 
 ## Arquitectura
 
-O app corre em dois modos:
+O app Streamlit corre em dois modos:
 
 | Modo | Transcrição | Análise | Diarização | Requisitos |
 |------|------------|---------|------------|------------|
-| **API** *(recomendado)* | IAedu / OpenAI | IAedu / Claude | pyannote local | API keys + HF Token |
-| **Local** | Whisper local (fallback) | - | pyannote local | GPU NVIDIA + HF Token |
+| **API** | Whisper local | Claude via IAedu | pyannote local | API keys + HF Token |
+| **Local** | Whisper local | Claude via IAedu | pyannote local | GPU NVIDIA + HF Token |
 
-No modo API, se o serviço IAedu não aceitar o ficheiro de áudio, o app cai automaticamente para Whisper local.
+A extensão Chrome usa sempre um servidor Flask local (`api_server.py`) para transcrição e diarização, e a IAedu para análise com Claude.
 
 ---
 
 ## Como correr
 
-### 1. Clonar o repositório
+### App Streamlit
+
+#### 1. Clonar o repositório
 
 ```bash
 git clone https://github.com/Araujo2112/2026-ei-aoopii-c25
 cd 2026-ei-aoopii-c25
 ```
 
-### 2. Configurar variáveis de ambiente
-
-Copia o ficheiro de exemplo e preenche os valores:
+#### 2. Configurar variáveis de ambiente
 
 ```bash
 cp .env.exemp .env
@@ -60,18 +77,11 @@ Edita o `.env`:
 # HuggingFace - necessário para diarização (pyannote)
 HF_TOKEN=your_huggingface_token_here
 
-# IAedu — API de transcrição (OpenAI)
-IAEDU_OPENAI_URL=...
-IAEDU_OPENAI_KEY=...
-IAEDU_OPENAI_CHANNEL=...
-
-# IAedu — API de análise (Claude)
+# IAedu — Claude
 IAEDU_CLAUDE_URL=...
 IAEDU_CLAUDE_KEY=...
 IAEDU_CLAUDE_CHANNEL=...
 ```
-
-> ⚠️ O `.env` está no `.gitignore` — nunca é commitado.
 
 #### HuggingFace Token
 
@@ -82,37 +92,12 @@ Cria um token em https://huggingface.co/settings/tokens e aceita os termos dos m
 
 > Os modelos (~7 GB) são descarregados automaticamente na primeira execução.
 
----
-
-### 3. Correr com Docker *(recomendado)*
-
-É a forma mais simples — não é preciso instalar Python, PyTorch nem dependências.
-
-**Modo API** (sem GPU necessária):
-
-```bash
-docker compose --profile api up --build
-```
-
-**Modo Local** (requer GPU NVIDIA):
-
-```bash
-docker compose --profile local up --build
-```
-
-Abre o browser em **http://localhost:8501**.
-
-> Na primeira execução o modo local demora mais — está a descarregar os modelos HuggingFace. Nas execuções seguintes usa a cache local.
-
----
-
-### 4. Correr sem Docker
-
-#### Instalar dependências
+#### 3. Instalar dependências e correr
 
 **Modo API:**
 ```bash
 pip install -r requirements_api.txt
+streamlit run src/app.py
 ```
 
 **Modo Local** — instala primeiro o PyTorch adequado à tua GPU:
@@ -124,22 +109,49 @@ pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
 # NVIDIA RTX 20xx / 30xx (CUDA 11.8)
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
 
-# Sem GPU
-pip install torch torchaudio
-```
-
-Depois:
-```bash
 pip install -r requirements.txt
-```
-
-> ⚠️ AMD, Intel Arc e Apple Silicon têm suporte limitado para `bitsandbytes`. O modo CPU funciona mas é significativamente mais lento.
-
-#### Iniciar o app
-
-```bash
 streamlit run src/app.py
 ```
+
+---
+
+### Extensão Chrome
+
+#### 1. Correr o servidor local
+
+```bash
+pip install flask flask-cors faster-whisper pyannote.audio soundfile torch
+cd src
+python -m api_server
+```
+
+O servidor fica disponível em `http://localhost:5000`.
+
+#### 2. Configurar as API keys da extensão
+
+Cria o ficheiro `src/extension/config.js` (não commitado — está no `.gitignore`):
+
+```javascript
+const CONFIG = {
+    IAEDU_CLAUDE_URL: "...",
+    IAEDU_CLAUDE_KEY: "...",
+    IAEDU_CLAUDE_CHANNEL: "...",
+};
+```
+
+#### 3. Instalar a extensão no Chrome
+
+1. Abre `chrome://extensions`
+2. Activa **Developer mode**
+3. Clica **Load unpacked** → selecciona a pasta `src/extension/`
+
+#### 4. Usar
+
+1. Abre o Google Meet
+2. Clica no ícone da extensão
+3. **Iniciar gravação** → aceita partilha de tab e activa "Partilhar áudio do separador"
+4. Aceita permissão de microfone
+5. No fim da reunião, **Parar gravação** → a sidebar abre com transcrição por locutor e análise automática
 
 ---
 
@@ -148,13 +160,20 @@ streamlit run src/app.py
 ```
 2026-ei-aoopii-c25/
 ├── src/
-│   └── app.py                # Aplicação principal
+│   ├── extension/            # Extensão Chrome
+│   │   ├── manifest.json
+│   │   ├── background.js
+│   │   ├── content.js
+│   │   ├── popup.html
+│   │   ├── popup.js
+│   │   ├── sidebar.css
+│   │   ├── api.js
+│   │   └── icons/
+│   ├── app.py                # App Streamlit
+│   └── api_server.py         # Servidor Flask para a extensão
 ├── data/                     # Dados de teste
-├── docs/                     # Documentação adicional
+├── docs/                     # Documentação
 ├── notebooks/                # Exploração e protótipos
-├── docker                    # Dockerfile (targets: api, local)
-├── docker-compose.yml
-├── .dockerignore
 ├── requirements.txt          # Dependências modo local (GPU)
 ├── requirements_api.txt      # Dependências modo API (leve)
 ├── .env.exemp                # Template de variáveis de ambiente
