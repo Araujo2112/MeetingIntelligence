@@ -4,6 +4,12 @@
   "version": "1.0",
   "description": "Transcrição e análise automática de reuniões Google Meet",
 
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+
   "permissions": [
     "activeTab",
     "tabs",
@@ -21,7 +27,12 @@
 
   "action": {
     "default_title": "Meeting Intelligence",
-    "default_popup": "popup.html"
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
 
   "content_scripts": [
