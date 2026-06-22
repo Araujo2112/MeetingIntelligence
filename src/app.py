@@ -344,85 +344,12 @@ def run_diarization(waveform_tensor, hf_token, device):
 
 
 def run_transcription(audio_path, device=None, diarization=None):
-    """Transcribe audio using OpenAI API via IAedu"""
-    
-    url = os.getenv("IAEDU_OPENAI_URL")
-    api_key = os.getenv("IAEDU_OPENAI_KEY")
-    channel_id = os.getenv("IAEDU_OPENAI_CHANNEL")
-    
-    if not all([url, api_key, channel_id]):
-        raise ValueError("Missing IAedu OpenAI API credentials")
-    
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Ler ficheiro de áudio
-    with open(audio_path, "rb") as audio_file:
-        audio_data = audio_file.read()
-    
-    headers = {
-        "x-api-key": api_key
-    }
-    
-    data = {
-        "channel_id": channel_id,
-        "user_info": "{}",
-        "message": "Transcribe this audio file to text. Return ONLY the transcription text.",
-    }
-    
-    field_names = ["image", "file", "audio", "audio_file", "media", "attachment", "document"]
-    
-    transcription_text = None
-    for field_name in field_names:
-        thread_id = str(uuid.uuid4())
-        data["thread_id"] = thread_id
-        files = {
-            field_name: ("audio.wav", audio_data, "audio/wav"),
-        }
-        
-        try:
-            response = requests.post(url, data=data, files=files, headers=headers, timeout=60)
-            response.raise_for_status()
-        except requests.exceptions.RequestException:
-            continue
-        
-        raw_text = response.text.strip()
-        if not raw_text:
-            continue
-        
-        extracted = extract_stream_text(raw_text)
-        if not extracted:
-            continue
-        
-        extracted = extracted.replace("```json", "").replace("```", "").strip()
-        if not extracted:
-            continue
-
-        if is_transcription_failure(extracted):
-            continue
-        
-        transcription_text = extracted
-        break
-    
-    if not transcription_text:
-        st.warning("⚠️ IAedu OpenAI não aceitou o áudio. A usar Whisper local.")
-        if diarization is not None:
-            return transcribe_by_diarization(audio_path, diarization, device)
-        return transcribe_local(audio_path, device)
-    
-    segment = type("Segment", (), {
-        "start": 0,
-        "end": 0,
-        "text": transcription_text,
-        "words": []
-    })()
-    
-    info = type("TranscriptionInfo", (), {
-        "duration": librosa.get_duration(filename=audio_path),
-        "language": "auto"
-    })()
-    
-    return [segment], info
+    if diarization is not None:
+        return transcribe_by_diarization(audio_path, diarization, device)
+    return transcribe_local(audio_path, device)
 
 
 def get_speaker_at(diarization, timestamp):
@@ -479,6 +406,86 @@ def label_to_color(label):
     except (ValueError, IndexError):
         idx = 0
     return colors[idx % len(colors)]
+
+
+# ─────────────────────────────────────────────
+# EXPORTAÇÃO — junta análise inteligente + acta
+# ─────────────────────────────────────────────
+
+def build_export_txt(blocks, analysis):
+    """Gera o texto TXT incluindo a análise inteligente (se existir) + a acta."""
+    parts = []
+    if analysis:
+        parts.append("=== ANÁLISE INTELIGENTE ===\n")
+        parts.append(f"Resumo:\n{analysis.get('summary', 'N/A')}\n")
+
+        decisions = analysis.get("decisions", [])
+        parts.append(f"\nDecisões tomadas ({len(decisions)}):")
+        if decisions:
+            parts.extend([f"- {d}" for d in decisions])
+        else:
+            parts.append("- Nenhuma decisão identificada.")
+
+        action_items = analysis.get("action_items", [])
+        parts.append(f"\nPróximos passos ({len(action_items)}):")
+        if action_items:
+            for item in action_items:
+                owner = item.get("owner", "N/A")
+                task = item.get("task", "N/A")
+                deadline = item.get("deadline", "Não especificado")
+                parts.append(f"- [{owner}] {task} (prazo: {deadline})")
+        else:
+            parts.append("- Nenhum próximo passo identificado.")
+
+        questions = analysis.get("open_questions", [])
+        parts.append(f"\nQuestões em aberto ({len(questions)}):")
+        if questions:
+            parts.extend([f"- {q}" for q in questions])
+        else:
+            parts.append("- Nenhuma questão em aberto identificada.")
+
+        parts.append("\n\n=== ACTA DA REUNIÃO ===\n")
+
+    parts.append("\n\n".join([f"{b['speaker']}:\n{b['text']}" for b in blocks]))
+    return "\n".join(parts)
+
+
+def build_export_md(blocks, analysis):
+    """Gera o texto Markdown incluindo a análise inteligente (se existir) + a acta."""
+    parts = []
+    if analysis:
+        parts.append("## 🧠 Análise Inteligente\n")
+        parts.append(f"**Resumo:** {analysis.get('summary', 'N/A')}\n")
+
+        decisions = analysis.get("decisions", [])
+        parts.append(f"### 🔵 Decisões tomadas ({len(decisions)})")
+        if decisions:
+            parts.extend([f"- {d}" for d in decisions])
+        else:
+            parts.append("_Nenhuma decisão identificada._")
+
+        action_items = analysis.get("action_items", [])
+        parts.append(f"\n### 🟢 Próximos passos ({len(action_items)})")
+        if action_items:
+            for item in action_items:
+                owner = item.get("owner", "N/A")
+                task = item.get("task", "N/A")
+                deadline = item.get("deadline", "Não especificado")
+                parts.append(f"- **{owner}** — {task} (⏰ {deadline})")
+        else:
+            parts.append("_Nenhum próximo passo identificado._")
+
+        questions = analysis.get("open_questions", [])
+        parts.append(f"\n### 🟡 Questões em aberto ({len(questions)})")
+        if questions:
+            parts.extend([f"- {q}" for q in questions])
+        else:
+            parts.append("_Nenhuma questão em aberto identificada._")
+
+        parts.append("\n---\n\n## 📝 Acta da Reunião\n")
+
+    parts.append("\n\n".join([f"**{b['speaker']}:** {b['text']}" for b in blocks]))
+    return "\n".join(parts)
 
 
 def render_results(results, filename):
@@ -557,8 +564,8 @@ def render_results(results, filename):
     st.divider()
     st.subheader("📤 Exportar")
 
-    full_text = "\n\n".join([f"{b['speaker']}:\n{b['text']}" for b in blocks])
-    md_text = "\n\n".join([f"**{b['speaker']}:** {b['text']}" for b in blocks])
+    full_text = build_export_txt(blocks, analysis)
+    md_text = build_export_md(blocks, analysis)
 
     col_a, col_b, col_c = st.columns(3)
     with col_a:
@@ -571,8 +578,12 @@ def render_results(results, filename):
             mime="text/markdown", use_container_width=True)
     with col_c:
         if analysis:
+            export_json = {
+                "analysis": analysis,
+                "transcript": blocks,
+            }
             st.download_button("⬇️ Download JSON",
-                data=json.dumps(analysis, indent=2, ensure_ascii=False),
+                data=json.dumps(export_json, indent=2, ensure_ascii=False),
                 file_name=f"analysis_{filename}.json",
                 mime="application/json", use_container_width=True)
 

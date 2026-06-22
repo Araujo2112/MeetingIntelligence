@@ -7,6 +7,7 @@
   var recordingStart   = null;
   var transcriptBlocks = [];
   var speakerColors    = {};
+  var lastAnalysis      = null;   // guarda a última análise para o export
   var COLORS = ["#6366f1", "#06b6d4", "#10b981", "#f59e0b", "#f43f5e", "#a855f7"];
 
   // Acumuladores de áudio — mix tab + mic num único recorder
@@ -280,8 +281,12 @@
     chrome.runtime.sendMessage({ action: "ANALYZE", blocks: transcriptBlocks }, function(res) {
       loadingEl.classList.add("mi-hidden");
       btnAnalyze.disabled = false;
-      if (res && res.success) renderAnalysis(res.data);
-      else alert("Erro na análise: " + (res && res.error || "desconhecido"));
+      if (res && res.success) {
+        lastAnalysis = res.data;   // guarda para o export
+        renderAnalysis(res.data);
+      } else {
+        alert("Erro na análise: " + (res && res.error || "desconhecido"));
+      }
     });
   }
 
@@ -323,9 +328,55 @@
   }
 
   // ── Exportar ──────────────────────────────
+  function buildAnalysisText(data) {
+    if (!data) return "";
+    var lines = ["=== ANÁLISE INTELIGENTE ===", ""];
+    lines.push("Resumo:");
+    lines.push(data.summary || "N/A");
+    lines.push("");
+
+    var decisions = data.decisions || [];
+    lines.push("Decisões tomadas (" + decisions.length + "):");
+    if (decisions.length) {
+      decisions.forEach(function(d) { lines.push("- " + d); });
+    } else {
+      lines.push("- Nenhuma decisão identificada.");
+    }
+    lines.push("");
+
+    var actionItems = data.action_items || [];
+    lines.push("Próximos passos (" + actionItems.length + "):");
+    if (actionItems.length) {
+      actionItems.forEach(function(item) {
+        var owner = item.owner || "N/A";
+        var task = item.task || "N/A";
+        var deadline = item.deadline || "Não especificado";
+        lines.push("- [" + owner + "] " + task + " (prazo: " + deadline + ")");
+      });
+    } else {
+      lines.push("- Nenhum próximo passo identificado.");
+    }
+    lines.push("");
+
+    var questions = data.open_questions || [];
+    lines.push("Questões em aberto (" + questions.length + "):");
+    if (questions.length) {
+      questions.forEach(function(q) { lines.push("- " + q); });
+    } else {
+      lines.push("- Nenhuma questão em aberto identificada.");
+    }
+    lines.push("");
+    lines.push("=== ACTA DA REUNIÃO ===");
+    lines.push("");
+    return lines.join("\n");
+  }
+
   function exportTranscript() {
-    var lines = transcriptBlocks.map(function(b) { return b.speaker + ":\n" + b.text; }).join("\n\n");
-    var blob = new Blob([lines], { type: "text/plain" });
+    var analysisText = buildAnalysisText(lastAnalysis);
+    var transcriptText = transcriptBlocks.map(function(b) { return b.speaker + ":\n" + b.text; }).join("\n\n");
+    var fullText = analysisText + transcriptText;
+
+    var blob = new Blob([fullText], { type: "text/plain" });
     var url  = URL.createObjectURL(blob);
     var a    = document.createElement("a");
     a.href     = url;
