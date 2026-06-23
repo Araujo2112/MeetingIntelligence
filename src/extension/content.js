@@ -138,18 +138,30 @@
   // ── Envia blob completo para transcrever ──
   function transcribeFullBlob(blob) {
     return new Promise(function(resolve, reject) {
-      var reader = new FileReader();
-      reader.onloadend = function() {
-        var audioData = Array.from(new Uint8Array(reader.result));
-        chrome.runtime.sendMessage(
-          { action: "TRANSCRIBE", audioData: audioData, mimeType: "audio/webm" },
-          function(res) {
-            if (res && res.success) resolve(res);
-            else reject(new Error(res ? res.error : "Sem resposta"));
-          }
-        );
-      };
-      reader.readAsArrayBuffer(blob);
+      var formData = new FormData();
+      formData.append("audio", blob, "audio.webm");
+
+      fetch("http://localhost:5000/api/transcribe", {
+        method: "POST",
+        body: formData,
+      })
+      .then(function(res) { return res.json(); })
+      .then(function(data) {
+        if (!data.success) {
+          reject(new Error(data.error || "Erro do servidor"));
+          return;
+        }
+        if (data.diarized && Array.isArray(data.blocks) && data.blocks.length > 0) {
+          resolve({ success: true, diarized: true, blocks: data.blocks });
+        } else if (data.text && data.text.trim().length > 1) {
+          resolve({ success: true, diarized: false, text: data.text.trim() });
+        } else {
+          reject(new Error("Sem texto na resposta"));
+        }
+      })
+      .catch(function(err) {
+        reject(new Error("Sem resposta do servidor: " + err.message));
+      });
     });
   }
 
@@ -245,6 +257,7 @@
         loadingEl.classList.add("mi-hidden");
         emptyEl.classList.remove("mi-hidden");
         emptyEl.querySelector("p").textContent = "Sem áudio suficiente para transcrever.";
+        console.log("[MI] mixChunks:", mixChunks.length, "fullBlob size:", fullBlob ? fullBlob.size : 0);
         return;
       }
 
